@@ -1,0 +1,4 @@
+hardening_timezone: UTC
+hardening_sysctl_file: /etc/sysctl.d/network-stack.conf
+hardening_fail2ban_package: fail2ban
+hardening_fail2ban_service: fail2ban

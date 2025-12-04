@@ -1,0 +1,132 @@
+- name: Check timedatectl availability
+  ansible.builtin.command: command -v timedatectl
+  register: hardening_timedatectl_check
+  changed_when: false
+  failed_when: false
+
+- name: Check current timezone
+  ansible.builtin.command: timedatectl show -p Timezone --value
+  register: hardening_timezone_current
+  changed_when: false
+  when: hardening_timedatectl_check.rc == 0
+
+- name: Set timezone
+  ansible.builtin.command: "timedatectl set-timezone {{ hardening_timezone }}"
+  when:
+    - hardening_timedatectl_check.rc == 0
+    - hardening_timezone_current.stdout != hardening_timezone
+
+- name: Warn if timedatectl is unavailable
+  ansible.builtin.debug:
+    msg: "timedatectl недоступен на целевой системе; задача настройки timezone пропущена."
+  when: hardening_timedatectl_check.rc != 0
+
+- name: Refresh apt cache (Debian/Ubuntu)
+  ansible.builtin.apt:
+    update_cache: true
+  when: ansible_facts.os_family == "Debian"
+
+- name: Install fail2ban
+  ansible.builtin.package:
+    name: "{{ hardening_fail2ban_package }}"
+    state: present
+  when: ansible_facts.os_family in ["Debian", "RedHat"]
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Ensure fail2ban service is enabled and running
+  ansible.builtin.service:
+    name: "{{ hardening_fail2ban_service }}"
+    state: started
+    enabled: true
+  when:
+    - ansible_facts.services is defined
+    - "'{{ hardening_fail2ban_service }}.service' in ansible_facts.services"
+
+- name: Warn if fail2ban service unit not found
+  ansible.builtin.debug:
+    msg: "Сервис {{ hardening_fail2ban_service }} не найден (возможно, init не systemd); проверьте вручную."
+  when: ansible_facts.services is defined and "'{{ hardening_fail2ban_service }}.service' not in ansible_facts.services"
+
+- name: Enforce RPM gpgcheck
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: '^gpgcheck='
+    line: gpgcheck=1
+    create: false
+  loop:
+    - /etc/yum.conf
+    - /etc/dnf/dnf.conf
+  when: ansible_facts.os_family == "RedHat"
+
+- name: Enforce permissions on critical system files
+  vars:
+    hardening_critical_paths:
+      - { path: "/etc/passwd", mode: "0644", owner: "root", group: "root" }
+      - { path: "/etc/passwd-", mode: "0644", owner: "root", group: "root" }
+      - { path: "/etc/group", mode: "0644", owner: "root", group: "root" }
+      - { path: "/etc/group-", mode: "0644", owner: "root", group: "root" }
+      - { path: "/etc/shadow", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/shadow-", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/gshadow", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/gshadow-", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/grub.cfg", mode: "0600", owner: "root", group: "root" }
+      - { path: "/boot/grub2/grubenv", mode: "0600", owner: "root", group: "root" }
+      - { path: "/boot/grub2/grub.cfg", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/ssh/sshd_config", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/cron.hourly", mode: "0700", owner: "root", group: "root" }
+      - { path: "/etc/cron.daily", mode: "0700", owner: "root", group: "root" }
+      - { path: "/etc/cron.weekly", mode: "0700", owner: "root", group: "root" }
+      - { path: "/etc/cron.monthly", mode: "0700", owner: "root", group: "root" }
+      - { path: "/etc/cron.d", mode: "0600", owner: "root", group: "root" }
+      - { path: "/etc/crontab", mode: "0600", owner: "root", group: "root" }
+  block:
+    - name: Gather critical path facts
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+      loop: "{{ hardening_critical_paths }}"
+      register: hardening_critical_path_stats
+
+    - name: Apply ownership and permissions
+      ansible.builtin.file:
+        path: "{{ item.stat.path }}"
+        owner: "{{ item.item.owner }}"
+        group: "{{ item.item.group }}"
+        mode: "{{ item.item.mode }}"
+      loop: "{{ hardening_critical_path_stats.results }}"
+      when: item.stat.exists
+
+- name: Configure network stack sysctl parameters
+  ansible.builtin.copy:
+    dest: "{{ hardening_sysctl_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      net.ipv6.conf.default.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv6.conf.default.accept_ra = 0
+      net.ipv6.conf.all.accept_ra = 0
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv4.conf.default.accept_source_route = 0
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv4.icmp_ignore_bogus_error_responses = 1
+      net.ipv4.conf.default.accept_redirects = 0
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.rp_filter = 1
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.secure_redirects = 0
+      net.ipv4.conf.all.secure_redirects = 0
+      net.ipv4.tcp_syncookies = 1
+      net.ipv4.conf.default.log_martians = 1
+      net.ipv4.conf.all.log_martians = 1
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+      net.ipv4.ip_forward = 0
+      net.ipv4.conf.default.send_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.tcp_fin_timeout = 30
+      net.ipv4.tcp_keepalive_time = 180
+      net.ipv4.tcp_keepalive_intvl = 10
+      net.ipv4.tcp_keepalive_probes = 3
+  notify: Reload sysctl

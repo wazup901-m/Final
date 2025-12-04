@@ -1,0 +1,15 @@
+SecRuleEngine On
+SecRequestBodyAccess On
+SecResponseBodyAccess Off
+SecResponseBodyLimit 524288
+
+# Логи модсека
+SecAuditEngine RelevantOnly
+SecAuditLogParts ABIJDEFHZ
+SecAuditLogType Serial
+SecAuditLog /var/log/modsec_audit.log
+SecAuditLogDirMode 0700
+
+# Подключаем OWASP CRS
+Include {{ modsec_crs_dir }}/crs-setup.conf
+Include {{ modsec_crs_dir }}/rules/*.conf

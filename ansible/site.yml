@@ -1,0 +1,258 @@
+- hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+    hardening_timezone: UTC
+    hardening_sysctl_file: /etc/sysctl.d/network-stack.conf
+    hardening_fail2ban_package: fail2ban
+    hardening_fail2ban_service: fail2ban
+  pre_tasks:
+    - name: Ensure Python 3 is present for Ansible (apt)
+      ansible.builtin.raw: |
+        test -e /usr/bin/python3 || (apt-get update -y && apt-get install -y python3)
+      changed_when: false
+
+    - name: Gather facts after bootstrapping Python
+      ansible.builtin.setup:
+
+  roles:
+    - hardening
+
+- hosts: app
+  gather_facts: true
+  become: true
+  collections:
+    - community.docker
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+    docker_repo_key: /etc/apt/keyrings/docker.asc
+    docker_repo: "https://download.docker.com/linux/debian"
+    docker_codename: "{{ ansible_facts.lsb.codename | default('bookworm') }}"
+    bank_repo: "https://github.com/hdiv/insecure-bank-js.git"
+    bank_path: /opt/insecure-bank-js
+    bank_image: insecure-bank-js
+    bank_port: 3000
+  tasks:
+    - name: Install Docker prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - git
+        state: present
+        update_cache: true
+
+    - name: Ensure keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker GPG key (asc)
+      ansible.builtin.get_url:
+        url: "{{ docker_repo }}/gpg"
+        dest: "{{ docker_repo_key }}"
+        mode: "0644"
+
+    - name: Add Docker apt sources file
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        mode: "0644"
+        content: |
+          Types: deb
+          URIs: {{ docker_repo }}
+          Suites: {{ docker_codename }}
+          Components: stable
+          Signed-By: {{ docker_repo_key }}
+
+    - name: Update apt cache after adding Docker repo
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Docker engine and Python SDK
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+          - python3-docker
+        state: present
+        update_cache: true
+
+    - name: Add debian user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+    - name: Ensure docker service is enabled and running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Checkout insecure-bank-js sources
+      ansible.builtin.git:
+        repo: "{{ bank_repo }}"
+        dest: "{{ bank_path }}"
+        version: main
+        update: true
+
+    - name: Build insecure-bank-js image locally
+      community.docker.docker_image:
+        name: "{{ bank_image }}"
+        tag: latest
+        source: build
+        build:
+          path: "{{ bank_path }}"
+          pull: true
+        force_source: true
+
+    - name: Run insecure-bank-js container
+      community.docker.docker_container:
+        name: insecure-bank-app
+        image: "{{ bank_image }}:latest"
+        published_ports:
+          - "{{ bank_port }}:{{ bank_port }}"
+        restart_policy: unless-stopped
+      vars:
+        ansible_python_interpreter: /usr/bin/python3
+      become: true
+
+- hosts: proxy
+  gather_facts: true
+  become: true
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+    backend_host: "{{ hostvars[groups['app'][0]].private_ip | default(hostvars[groups['app'][0]].ansible_host) }}"
+    backend_port: 3000
+    nginx_site: /etc/nginx/sites-available/default
+    nginx_ssl_dir: /etc/nginx/ssl
+    nginx_cert: "{{ nginx_ssl_dir }}/nginx-selfsigned.crt"
+    nginx_key: "{{ nginx_ssl_dir }}/nginx-selfsigned.key"
+    modsec_conf: /etc/nginx/modsec/main.conf
+    modsec_dir: /etc/nginx/modsec
+    modsec_crs_version: "4.0.0"
+    modsec_crs_dir: "{{ modsec_dir }}/crs"
+  tasks:
+    - name: Install nginx and modsecurity
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - libnginx-mod-http-modsecurity
+          - openssl
+          - rsync
+        state: present
+        update_cache: true
+
+    - name: Ensure nginx sites-available directory exists
+      ansible.builtin.file:
+        path: /etc/nginx/sites-available
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure nginx ssl directory exists
+      ansible.builtin.file:
+        path: "{{ nginx_ssl_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Generate self-signed certificate for nginx
+      ansible.builtin.command: >
+        openssl req -x509 -nodes -newkey rsa:2048
+        -days 365
+        -subj "/CN={{ backend_host }}"
+        -keyout {{ nginx_key }}
+        -out {{ nginx_cert }}
+      args:
+        creates: "{{ nginx_cert }}"
+
+    - name: Ensure modsecurity directory exists
+      ansible.builtin.file:
+        path: "{{ modsec_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy modsecurity main config
+      ansible.builtin.template:
+        src: templates/modsecurity.conf.j2
+        dest: "{{ modsec_conf }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Download OWASP CRS archive
+      ansible.builtin.get_url:
+        url: "https://github.com/coreruleset/coreruleset/archive/refs/tags/v{{ modsec_crs_version }}.tar.gz"
+        dest: "{{ modsec_dir }}/crs.tar.gz"
+        mode: "0644"
+
+    - name: Unpack OWASP CRS
+      ansible.builtin.unarchive:
+        src: "{{ modsec_dir }}/crs.tar.gz"
+        dest: "{{ modsec_dir }}"
+        remote_src: true
+        creates: "{{ modsec_dir }}/coreruleset-{{ modsec_crs_version }}"
+
+    - name: Sync CRS to target directory
+      ansible.builtin.command: >
+        rsync -a {{ modsec_dir }}/coreruleset-{{ modsec_crs_version }}/ {{ modsec_crs_dir }}/
+      args:
+        creates: "{{ modsec_crs_dir }}/rules"
+
+    - name: Ensure crs-setup.conf present
+      ansible.builtin.copy:
+        src: "{{ modsec_crs_dir }}/crs-setup.conf.example"
+        dest: "{{ modsec_crs_dir }}/crs-setup.conf"
+        remote_src: true
+        force: false
+
+    - name: Deploy secure proxy configuration
+      ansible.builtin.template:
+        src: templates/nginx-site.conf.j2
+        dest: "{{ nginx_site }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Ensure nginx is enabled and running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+      when:
+        - ansible_facts.services is defined
+        - "'nginx.service' in ansible_facts.services"
+
+    - name: Warn if nginx service unit not found
+      ansible.builtin.debug:
+        msg: "nginx сервис не обнаружен; проверьте установку пакетов и доступность systemd."
+      when:
+        - ansible_facts.services is defined
+        - "'nginx.service' not in ansible_facts.services"
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.command: nginx -t
+      notify: do reload
+      changed_when: false
+
+    - name: do reload
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

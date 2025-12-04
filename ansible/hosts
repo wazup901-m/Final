@@ -1,0 +1,5 @@
+[app]
+bank-app ansible_host=158.160.34.47 ansible_user=debian private_ip=192.168.20.31
+
+[proxy]
+bank-proxy ansible_host=158.160.114.204 ansible_user=debian private_ip=192.168.20.32
